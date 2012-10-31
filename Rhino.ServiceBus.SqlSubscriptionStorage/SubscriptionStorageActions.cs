@@ -5,7 +5,7 @@ using System.Data.SqlClient;
 
 namespace Rhino.ServiceBus
 {
-    internal class SubscriptionStorageActions
+    internal class SubscriptionStorageActions : ISubscriptionStorageActions
     {
         private readonly SqlConnection connection;
         private readonly SqlTransaction transaction;

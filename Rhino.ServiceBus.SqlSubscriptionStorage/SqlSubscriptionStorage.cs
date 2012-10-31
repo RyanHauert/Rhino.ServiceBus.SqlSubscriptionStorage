@@ -1,8 +1,7 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Configuration;
-using System.Data;
-using System.Data.SqlClient;
 using System.Linq;
 using Common.Logging;
 using Rhino.ServiceBus.Impl;
@@ -14,12 +13,22 @@ namespace Rhino.ServiceBus
 {
     public class SqlSubscriptionStorage : ISubscriptionStorage, IMessageModule
     {
-        private readonly string _connectionString;
+        private static readonly ConcurrentDictionary<Type, IEnumerable<Uri>> SubscriptionCache
+            = new ConcurrentDictionary<Type, IEnumerable<Uri>>();
+
+        private readonly IDatabaseAccess _databaseAccess;
         private readonly ILog _logger = LogManager.GetLogger(typeof(SqlSubscriptionStorage));
 
         public SqlSubscriptionStorage()
         {
-            _connectionString = ConfigurationManager.ConnectionStrings["Rhino.ServiceBus.SqlSubscriptionStorage"].ConnectionString;
+            string connectionString = ConfigurationManager.ConnectionStrings["Rhino.ServiceBus.SqlSubscriptionStorage"].ConnectionString;
+            _databaseAccess = new DatabaseAccess(connectionString, 
+                (connection, transaction) => new SubscriptionStorageActions(connection, transaction));
+        }
+
+        internal SqlSubscriptionStorage(IDatabaseAccess databaseAccess)
+        {
+            _databaseAccess = databaseAccess;
         }
 
         public void AddLocalInstanceSubscription(IMessageConsumer consumer)
@@ -28,7 +37,7 @@ namespace Rhino.ServiceBus
 
         public bool AddSubscription(string type, string endpoint)
         {
-            Subscription((subscription =>
+            _databaseAccess.Subscription((subscription =>
             {
                 subscription.AddSubscription(type, endpoint);
                 subscription.Commit();
@@ -66,20 +75,28 @@ namespace Rhino.ServiceBus
 
         public IEnumerable<Uri> GetSubscriptionsFor(Type type)
         {
-            IEnumerable<Uri> subscriptions = new List<Uri>();
+            IEnumerable<Uri> subscriptions = null;
             try
             {
-                Subscription(subscription =>
+                _databaseAccess.Subscription(subscription =>
                 {
                     subscriptions = subscription.GetSubscriptions(type.FullName).ToList();
                     subscription.Commit();
                 });
+                SubscriptionCache[type] = subscriptions;
             }
             catch (Exception ex)
             {
                 _logger.Error(string.Format("Error getting subscriptions for {0}", type.FullName), ex);
+
+                IEnumerable<Uri> local;
+                if (SubscriptionCache.TryGetValue(type, out local))
+                {
+                    _logger.WarnFormat("Using cached subscriptions for {0}", type.FullName);
+                    subscriptions = local;
+                }
             }
-            return subscriptions;
+            return subscriptions ?? new List<Uri>();
         }
 
         public void Init(ITransport transport, IServiceBus bus)
@@ -97,11 +114,12 @@ namespace Rhino.ServiceBus
 
         public void RemoveSubscription(string type, string endpoint)
         {
-            Subscription(subscription =>
+            _databaseAccess.Subscription(subscription =>
             {
                 subscription.RemoveSubscription(type, endpoint);
                 subscription.Commit();
             });
+            RaiseSubscriptionChanged();
             _logger.DebugFormat("Removed subscription for {0} message at endpoint {1}", type, endpoint);
         }
 
@@ -110,28 +128,14 @@ namespace Rhino.ServiceBus
             transport.AdministrativeMessageArrived -= TransportAdministrativeMessageArrived;
         }
 
-        void RaiseSubscriptionChanged()
+        private void RaiseSubscriptionChanged()
         {
             var action = SubscriptionChanged;
-            if (action == null)
-                return;
-            action();
+            if (action != null)
+                action();
         }
 
-        void Subscription(Action<SubscriptionStorageActions> action)
-        {
-            using (var connection = new SqlConnection(_connectionString))
-            {
-                connection.Open();
-                using (var transaction = connection.BeginTransaction(IsolationLevel.ReadUncommitted))
-                {
-                    var subscriptionStorageActions = new SubscriptionStorageActions(connection, transaction);
-                    action(subscriptionStorageActions);
-                }
-            }
-        }
-
-        bool TransportAdministrativeMessageArrived(CurrentMessageInformation msgInfo)
+        private bool TransportAdministrativeMessageArrived(CurrentMessageInformation msgInfo)
         {
             var subscription = msgInfo.Message as AddSubscription;
             if (subscription != null)
